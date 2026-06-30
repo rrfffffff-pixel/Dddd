@@ -29,6 +29,12 @@ class LLMResponse:
     def is_error(self) -> bool:
         return self.content.startswith("Error:")
 
+    @property
+    def total_tokens(self) -> int:
+        return self.usage.get("total_tokens", 0) or (
+            self.usage.get("input_tokens", 0) + self.usage.get("output_tokens", 0)
+        )
+
 
 class LLMProvider(ABC):
     @abstractmethod
@@ -86,7 +92,7 @@ class OllamaProvider(LLMProvider):
                 return LLMResponse(
                     content=content,
                     tool_calls=tool_calls,
-                    usage=data.get("eval_count", {}),
+                    usage={"total_tokens": data.get("eval_count", 0)},
                     model=self.model,
                     finish_reason=data.get("done_reason", ""),
                 )
@@ -95,9 +101,9 @@ class OllamaProvider(LLMProvider):
                 logger.warning(f"Ollama connection failed (attempt {attempt + 1}): {e}")
                 if attempt < self.max_retries - 1:
                     time.sleep(2 ** attempt)
-            except requests.exceptions.Timeout as e:
-                last_error = e
+            except requests.exceptions.Timeout:
                 logger.warning(f"Ollama timeout (attempt {attempt + 1})")
+                last_error = Exception("Request timed out")
             except Exception as e:
                 last_error = e
                 logger.error(f"Ollama error: {e}")
@@ -184,6 +190,105 @@ class OpenAIProvider(LLMProvider):
         return LLMResponse(content=f"Error: {last_error}", model=self.model)
 
 
+class AnthropicProvider(LLMProvider):
+    def __init__(
+        self,
+        model: str = "claude-sonnet-4-20250514",
+        api_key: str = "",
+        max_retries: int = 3,
+        timeout: int = 120,
+    ) -> None:
+        self.model = model
+        self.api_key = api_key
+        self.max_retries = max_retries
+        self.timeout = timeout
+
+    def chat(self, messages: list[dict], tools: list[dict] | None = None) -> LLMResponse:
+        system_msg = ""
+        user_messages = []
+        for m in messages:
+            if m["role"] == "system":
+                system_msg += m["content"] + "\n"
+            else:
+                user_messages.append(m)
+
+        if not user_messages:
+            user_messages = [{"role": "user", "content": "Hello"}]
+
+        payload: dict = {
+            "model": self.model,
+            "max_tokens": 4096,
+            "messages": user_messages,
+        }
+        if system_msg.strip():
+            payload["system"] = system_msg.strip()
+
+        if tools:
+            anthropic_tools = []
+            for t in tools:
+                fn = t.get("function", {})
+                anthropic_tools.append({
+                    "name": fn.get("name", ""),
+                    "description": fn.get("description", ""),
+                    "input_schema": fn.get("parameters", {}),
+                })
+            payload["tools"] = anthropic_tools
+
+        last_error = None
+        for attempt in range(self.max_retries):
+            try:
+                r = requests.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": self.api_key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json=payload,
+                    timeout=self.timeout,
+                )
+                r.raise_for_status()
+                data = r.json()
+
+                content = ""
+                tool_calls = []
+                for block in data.get("content", []):
+                    if block["type"] == "text":
+                        content += block["text"]
+                    elif block["type"] == "tool_use":
+                        tool_calls.append({
+                            "function": {
+                                "name": block["name"],
+                                "arguments": block.get("input", {}),
+                            }
+                        })
+
+                usage = data.get("usage", {})
+                return LLMResponse(
+                    content=content,
+                    tool_calls=tool_calls,
+                    usage={
+                        "input_tokens": usage.get("input_tokens", 0),
+                        "output_tokens": usage.get("output_tokens", 0),
+                        "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+                    },
+                    model=self.model,
+                    finish_reason=data.get("stop_reason", ""),
+                )
+            except requests.exceptions.ConnectionError as e:
+                last_error = e
+                if attempt < self.max_retries - 1:
+                    time.sleep(2 ** attempt)
+            except requests.exceptions.Timeout:
+                last_error = Exception("Request timed out")
+            except Exception as e:
+                last_error = e
+                logger.error(f"Anthropic error: {e}")
+                break
+
+        return LLMResponse(content=f"Error: {last_error}", model=self.model)
+
+
 class MockProvider(LLMProvider):
     """Mock LLM provider for testing."""
 
@@ -211,6 +316,11 @@ def create_provider(provider: str = "ollama", **kwargs) -> LLMProvider:
             model=kwargs.get("model", "gpt-4o"),
             api_key=kwargs.get("api_key", ""),
             base_url=kwargs.get("base_url", "https://api.openai.com/v1"),
+        )
+    elif provider == "anthropic":
+        return AnthropicProvider(
+            model=kwargs.get("model", "claude-sonnet-4-20250514"),
+            api_key=kwargs.get("api_key", ""),
         )
     elif provider == "mock":
         return MockProvider(responses=kwargs.get("responses"))

@@ -20,8 +20,11 @@ class Subtask:
     id: str
     description: str
     agent_name: str
+    depends_on: list[str] = field(default_factory=list)
     status: str = "pending"  # pending, running, done, failed
     result: str = ""
+    retry_count: int = 0
+    max_retries: int = 1
 
 
 class TaskOrchestrator:
@@ -43,29 +46,33 @@ class TaskOrchestrator:
             agent.set_context(self.context)
 
     def decompose_task(self, task: str) -> list[Subtask]:
-        """Use LLM to break a task into subtasks with agent assignments."""
         agent_names = list(self.agents.keys())
 
-        prompt = f"""Break this coding task into subtasks. Assign each to an agent.
+        prompt = f"""Break this coding task into an ordered sequence of subtasks.
 
 Available agents: {', '.join(agent_names)}
 
 Task: {task}
 
-Output a JSON array of subtasks. Each subtask has:
-- id: sequential number (1, 2, 3...)
-- description: what to do (be specific and actionable)
+Output a JSON array. Each item:
+- id: string ("1", "2", ...)
+- description: specific, actionable instruction
 - agent_name: one of [{', '.join(agent_names)}]
+- depends_on: list of subtask IDs that must complete first (empty if none)
+
+Agent roles:
+- "code": read, write, edit source files
+- "test": run test suites, verify correctness
+- "shell": install deps, run build commands, git operations
+- "review": code review, security checks (use after code changes)
 
 Rules:
-- Keep it to 2-5 subtasks for efficiency
-- Each subtask should be self-contained
-- Use "code" for reading/writing/editing files
-- Use "test" for running tests
-- Use "shell" for installing dependencies or running commands
-- Use "review" only after code changes are made
+- 2-6 subtasks
+- Include a test step after code changes
+- Dependencies must form a DAG (no cycles)
+- Start with exploration/reading, end with verification
 
-Output ONLY the JSON array, no other text."""
+Output ONLY the JSON array."""
 
         response = self.provider.chat_simple(prompt, system="You are a task planner. Output only valid JSON.")
 
@@ -78,49 +85,73 @@ Output ONLY the JSON array, no other text."""
                         id=str(s.get("id", i + 1)),
                         description=s.get("description", ""),
                         agent_name=s.get("agent_name", "code"),
+                        depends_on=[str(d) for d in s.get("depends_on", [])],
                     )
                     for i, s in enumerate(subtasks_data)
                 ]
         except (json.JSONDecodeError, KeyError) as e:
             logger.warning(f"Failed to parse task decomposition: {e}")
 
-        # Fallback: single task with code agent
         return [Subtask(id="1", description=task, agent_name="code")]
 
+    def _get_ready_tasks(self, subtasks: list[Subtask]) -> list[Subtask]:
+        done_ids = {s.id for s in subtasks if s.status == "done"}
+        return [
+            s for s in subtasks
+            if s.status == "pending" and all(d in done_ids for d in s.depends_on)
+        ]
+
+    def _should_retry(self, subtask: Subtask, result: str) -> bool:
+        if subtask.retry_count >= subtask.max_retries:
+            return False
+        failure_indicators = ["error", "failed", "exception", "traceback", "assert"]
+        return any(ind in result.lower() for ind in failure_indicators)
+
     def run(self, task: str) -> str:
-        """Execute a complete coding task."""
         self.context.task_description = task
 
         print(f"\n{'='*60}")
         print(f"Task: {task}")
         print(f"{'='*60}\n")
 
-        # Decompose
         print("Planning...")
         subtasks = self.decompose_task(task)
         print(f"Plan: {len(subtasks)} subtasks\n")
 
         results = []
-        for subtask in subtasks:
-            agent = self.agents.get(subtask.agent_name)
-            if agent is None:
-                logger.warning(f"Unknown agent: {subtask.agent_name}, using code agent")
-                agent = self.agents.get("code")
-            if agent is None:
-                results.append(f"[{subtask.id}] Skipped - no agent available")
-                continue
+        max_rounds = len(subtasks) * 3  # allow retries
+        for round_num in range(max_rounds):
+            ready = self._get_ready_tasks(subtasks)
+            if not ready:
+                break
 
-            print(f"[{subtask.id}] {subtask.agent_name}: {subtask.description}")
-            subtask.status = "running"
+            for subtask in ready:
+                agent = self.agents.get(subtask.agent_name)
+                if agent is None:
+                    agent = self.agents.get("code")
+                if agent is None:
+                    subtask.status = "failed"
+                    subtask.result = f"No agent '{subtask.agent_name}' available"
+                    continue
 
-            result = agent.run(subtask.description)
-            subtask.result = result
-            subtask.status = "done"
+                dep_info = f" (after: {', '.join(subtask.depends_on)})" if subtask.depends_on else ""
+                retry_info = f" [retry {subtask.retry_count}]" if subtask.retry_count > 0 else ""
+                print(f"[{subtask.id}] {subtask.agent_name}: {subtask.description}{dep_info}{retry_info}")
+                subtask.status = "running"
 
-            print(f"  Result: {result[:200]}{'...' if len(result) > 200 else ''}\n")
-            results.append(f"[{subtask.id}] {result}")
+                result = agent.run(subtask.description)
+                subtask.result = result
+                subtask.status = "done"
 
-        # Summary
+                if self._should_retry(subtask, result) and subtask.retry_count < subtask.max_retries:
+                    subtask.retry_count += 1
+                    subtask.status = "pending"
+                    print(f"  Retrying ({subtask.retry_count}/{subtask.max_retries})...")
+                    continue
+
+                print(f"  Done: {result[:150]}{'...' if len(result) > 150 else ''}\n")
+                results.append(f"[{subtask.id}] {result}")
+
         print(f"{'='*60}")
         print("Task Complete")
         print(f"Files modified: {', '.join(self.context.files_written) or 'none'}")
@@ -130,16 +161,15 @@ Output ONLY the JSON array, no other text."""
         return "\n\n".join(results)
 
     def run_simple(self, task: str) -> str:
-        """Run a task with a single agent (no decomposition)."""
         self.context.task_description = task
 
-        # Pick the best agent for the task
         agent_name = "code"
-        if "test" in task.lower() or "run" in task.lower():
+        lower = task.lower()
+        if "test" in lower or "run" in lower:
             agent_name = "test"
-        elif "install" in task.lower() or "build" in task.lower():
+        elif "install" in lower or "build" in lower:
             agent_name = "shell"
-        elif "review" in task.lower() or "check" in task.lower():
+        elif "review" in lower or "check" in lower:
             agent_name = "review"
 
         agent = self.agents.get(agent_name)
