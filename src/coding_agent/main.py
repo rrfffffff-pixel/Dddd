@@ -32,8 +32,8 @@ def cli(ctx: click.Context, verbose: bool) -> None:
 
 @cli.command()
 @click.argument("task")
-@click.option("--model", "-m", default=None, help="Model to use (e.g. ollama/qwen3:1.7b)")
-@click.option("--provider", "-p", default=None, help="Provider (ollama, openai)")
+@click.option("--model", "-m", default=None, help="Model (e.g. qwen3:1.7b, deepseek-chat, gpt-4o)")
+@click.option("--provider", "-p", default=None, help="Provider (ollama, deepseek, openai, anthropic)")
 @click.option("--project", "-d", default=".", help="Project root directory")
 @click.pass_context
 def run(ctx: click.Context, task: str, model: str | None, provider: str | None, project: str) -> None:
