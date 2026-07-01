@@ -77,8 +77,11 @@ class Config:
                         setattr(config.intelligence, k, v)
 
         # Environment overrides
-        if api_key := os.environ.get("OPENAI_API_KEY"):
-            config.model.api_key = api_key
+        if os.environ.get("OPENROUTER_API_KEY"):
+            config.model.api_key = os.environ["OPENROUTER_API_KEY"]
+        if os.environ.get("OPENAI_API_KEY"):
+            if not config.model.api_key:
+                config.model.api_key = os.environ["OPENAI_API_KEY"]
         if model := os.environ.get("CODING_AGENT_MODEL"):
             config.model.model = model
 

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import ast
 import hashlib
-import json
-import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -154,31 +152,60 @@ class PromptCompressor:
         return "\n".join(result)
 
 
+class LRUCache:
+    """Simple LRU cache with max size eviction."""
+
+    def __init__(self, max_size: int = 500) -> None:
+        self._cache: dict[str, str] = {}
+        self._max_size = max_size
+        self._order: list[str] = []
+
+    def get(self, key: str) -> str | None:
+        if key in self._cache:
+            self._order.remove(key)
+            self._order.append(key)
+            return self._cache[key]
+        return None
+
+    def set(self, key: str, value: str) -> None:
+        if key in self._cache:
+            self._order.remove(key)
+        elif len(self._cache) >= self._max_size:
+            oldest = self._order.pop(0)
+            del self._cache[oldest]
+        self._cache[key] = value
+        self._order.append(key)
+
+    def clear(self) -> None:
+        self._cache.clear()
+        self._order.clear()
+
+
 class CacheLayer:
     """Cache LLM responses and tool results to avoid redundant calls."""
 
     def __init__(self) -> None:
-        self._llm_cache: dict[str, str] = {}
-        self._tool_cache: dict[str, str] = {}
+        self._llm_cache: LRUCache = LRUCache(max_size=200)
+        self._tool_cache: LRUCache = LRUCache(max_size=500)
         self._file_hashes: dict[str, str] = {}
 
     def file_changed(self, path: str, content: str) -> bool:
         new_hash = hashlib.md5(content.encode()).hexdigest()
         old_hash = self._file_hashes.get(path)
         self._file_hashes[path] = new_hash
-        return old_hash != new_hash
+        return old_hash is not None and old_hash != new_hash
 
     def get_llm_cache(self, prompt_hash: str) -> str | None:
         return self._llm_cache.get(prompt_hash)
 
     def set_llm_cache(self, prompt_hash: str, response: str) -> None:
-        self._llm_cache[prompt_hash] = response
+        self._llm_cache.set(prompt_hash, response)
 
     def get_tool_cache(self, key: str) -> str | None:
         return self._tool_cache.get(key)
 
     def set_tool_cache(self, key: str, result: str) -> None:
-        self._tool_cache[key] = result
+        self._tool_cache.set(key, result)
 
     def clear(self) -> None:
         self._llm_cache.clear()
@@ -191,39 +218,63 @@ class TaskClassifier:
 
     STATIC_PATTERNS = {
         "list_files": [
-            (r"list\s+(all\s+)?files", "code"),
-            (r"show\s+(me\s+)?(the\s+)?files", "code"),
-            (r"what\s+files", "code"),
+            (r"^(?:list|show)\s+(?:all\s+)?(?:the\s+)?files?", "code"),
+            (r"what\s+files?\s+(?:are|exist|in)", "code"),
+            (r"list\s+directory", "code"),
         ],
         "search": [
-            (r"find\s+(all\s+)?", "code"),
-            (r"search\s+(for\s+)?", "code"),
-            (r"grep\s+", "code"),
+            (r"^(?:find|search)\s+(?:all\s+)?", "code"),
+            (r"^(?:grep|search)\s+for\s+", "code"),
         ],
         "test": [
-            (r"run\s+(the\s+)?tests?", "test"),
-            (r"test\s+(the\s+)?code", "test"),
-            (r"check\s+if.*works", "test"),
+            (r"^run\s+(?:the\s+)?tests?", "test"),
+            (r"^test\s+(?:the\s+)?code", "test"),
         ],
         "install": [
-            (r"install\s+", "shell"),
-            (r"setup\s+", "shell"),
-            (r"pip\s+install", "shell"),
+            (r"^install\s+", "shell"),
+            (r"^(?:pip|npm|cargo|go)\s+install", "shell"),
         ],
         "review": [
-            (r"review\s+", "review"),
-            (r"check\s+for\s+(bugs|issues)", "review"),
-            (r"audit\s+", "review"),
+            (r"^review\s+", "review"),
+            (r"^check\s+(?:the\s+)?code\s+for\s+", "review"),
         ],
+    }
+
+    STATIC_ANSWERS = {
+        "hello": "Hello! I'm Coding Agent. How can I help you with your code today?",
+        "help": "Available commands via CLI: `coding-agent run <task>`, `coding-agent code <task>`, `coding-agent test`, `coding-agent info`.\n\nOr describe what you'd like me to do with your codebase.",
+        "hi": "Hi there! I'm ready to help with coding tasks.",
+        "thanks": "You're welcome! Let me know if you need anything else.",
     }
 
     def classify(self, task: str) -> TaskAnalysis:
         lower = task.lower().strip()
+
+        # Check for static answer patterns (no LLM needed)
+        for key, answer in self.STATIC_ANSWERS.items():
+            if lower == key or lower.startswith(key):
+                return TaskAnalysis(
+                    needs_llm=False,
+                    confidence=0.95,
+                    suggested_agent="code",
+                    static_answer=answer,
+                )
+
+        # Check for simple file listing (can be done without LLM)
+        if re.match(r"^(?:list|show)\s+(?:all\s+)?files?\s*$", lower):
+            return TaskAnalysis(
+                needs_llm=False,
+                confidence=0.9,
+                suggested_agent="code",
+                static_answer="Please use the list_files tool to browse the project structure.",
+            )
+
+        # Route to appropriate agent
         for category, patterns in self.STATIC_PATTERNS.items():
             for pattern, agent in patterns:
                 if re.search(pattern, lower):
                     return TaskAnalysis(
-                        needs_llm=True,  # Still needs LLM, just suggests agent
+                        needs_llm=True,
                         confidence=0.8,
                         suggested_agent=agent,
                     )

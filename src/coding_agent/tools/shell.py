@@ -2,16 +2,37 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
 from coding_agent.core.tool import Tool, ToolParameter, ToolRegistry
+
+DESTRUCTIVE_PATTERNS = [
+    r"(^|\s)rm\s+(-rf?\s+)?\/\s",
+    r"(^|\s)rm\s+(-rf?\s+)?/\s",
+    r"(^|\s)mkfs\.",
+    r"(^|\s)dd\s+if=",
+    r"(^|\s)format\s+",
+    r"(^|\s):\(\)\s*\{",
+    r"(^|\s)>\s+/dev/",
+    r"(^|\s)chmod\s+000\s+/\s",
+    r"(^|\s)mv\s+/\s+",
+    r"(^|\s)shutdown",
+    r"(^|\s)reboot",
+    r"(^|\s)poweroff",
+    r"(^|\s)init\s+0",
+    r"(^|\s)init\s+6",
+]
 
 
 def register_shell_tools(registry: ToolRegistry, project_root: str = ".") -> None:
     root = Path(project_root).resolve()
 
     def run_command(command: str, timeout: int = 30) -> str:
+        for pattern in DESTRUCTIVE_PATTERNS:
+            if re.search(pattern, command, re.IGNORECASE):
+                return f"Error: Command blocked for safety: {command[:100]}"
         try:
             result = subprocess.run(
                 command,
@@ -21,13 +42,14 @@ def register_shell_tools(registry: ToolRegistry, project_root: str = ".") -> Non
                 text=True,
                 timeout=timeout,
             )
-            output = ""
+            output_parts = []
             if result.stdout:
-                output += result.stdout
+                output_parts.append(result.stdout.rstrip())
             if result.stderr:
-                output += f"\nSTDERR:\n{result.stderr}" if output else result.stderr
+                output_parts.append(f"STDERR:\n{result.stderr.rstrip()}")
             if result.returncode != 0:
-                output += f"\n[Exit code: {result.returncode}]"
+                output_parts.append(f"Exit code: {result.returncode}")
+            output = "\n".join(output_parts)
             return output.strip()[:10000] if output.strip() else "Command completed (no output)"
         except subprocess.TimeoutExpired:
             return f"Error: Command timed out after {timeout}s"

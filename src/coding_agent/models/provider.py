@@ -295,6 +295,90 @@ class AnthropicProvider(LLMProvider):
         return LLMResponse(content=f"Error: {last_error}", model=self.model)
 
 
+class OpenRouterProvider(LLMProvider):
+    """OpenRouter provider - access 200+ models via unified API."""
+
+    def __init__(
+        self,
+        model: str = "xai/grok-2-1212",
+        api_key: str = "",
+        base_url: str = "https://openrouter.ai/api/v1",
+        max_retries: int = 3,
+        timeout: int = 120,
+    ) -> None:
+        self.model = model
+        self.api_key = api_key
+        self.base_url = base_url
+        self.max_retries = max_retries
+        self.timeout = timeout
+
+    def chat(self, messages: list[dict], tools: list[dict] | None = None) -> LLMResponse:
+        payload: dict = {
+            "model": self.model,
+            "messages": messages,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        last_error = None
+        for attempt in range(self.max_retries):
+            try:
+                r = requests.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "HTTP-Referer": "https://github.com/anomalyco/opencode",
+                        "X-Title": "Coding Agent",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=self.timeout,
+                )
+                r.raise_for_status()
+                data = r.json()
+
+                choice = data["choices"][0]
+                message = choice["message"]
+
+                tool_calls = []
+                for tc in message.get("tool_calls", []):
+                    fn = tc["function"]
+                    args = fn.get("arguments", "{}")
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except json.JSONDecodeError:
+                            args = {}
+                    tool_calls.append({
+                        "id": tc.get("id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": fn["name"],
+                            "arguments": args,
+                        },
+                    })
+
+                return LLMResponse(
+                    content=message.get("content", ""),
+                    tool_calls=tool_calls,
+                    usage=data.get("usage", {}),
+                    model=self.model,
+                    finish_reason=choice.get("finish_reason", ""),
+                )
+            except requests.exceptions.ConnectionError as e:
+                last_error = e
+                if attempt < self.max_retries - 1:
+                    time.sleep(2 ** attempt)
+            except requests.exceptions.Timeout:
+                last_error = Exception("Request timed out")
+            except Exception as e:
+                last_error = e
+                break
+
+        return LLMResponse(content=f"Error: {last_error}", model=self.model)
+
+
 class DeepSeekProvider(LLMProvider):
     """DeepSeek provider via OpenAI-compatible API."""
 
@@ -482,6 +566,12 @@ def create_provider(provider: str = "ollama", **kwargs) -> LLMProvider:
         return AnthropicProvider(
             model=kwargs.get("model", "claude-sonnet-4-20250514"),
             api_key=kwargs.get("api_key", ""),
+        )
+    elif provider == "openrouter":
+        return OpenRouterProvider(
+            model=kwargs.get("model", "xai/grok-2-1212"),
+            api_key=kwargs.get("api_key", ""),
+            base_url=kwargs.get("base_url", "https://openrouter.ai/api/v1"),
         )
     elif provider == "deepseek":
         return DeepSeekProvider(

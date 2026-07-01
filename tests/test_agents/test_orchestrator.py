@@ -85,4 +85,7 @@ def test_should_retry():
     assert orch._should_retry(subtask, "Success") is False
 
     subtask.retry_count = 1
+    assert orch._should_retry(subtask, "Error: failed") is True  # max_retries=3, so retry_count=1 still allows retry
+
+    subtask.retry_count = 3
     assert orch._should_retry(subtask, "Error: failed") is False

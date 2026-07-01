@@ -9,3 +9,6 @@ build/
 venv/
 .env
 *.log
+SWE-agent/
+open-interpreter/
+aider/
